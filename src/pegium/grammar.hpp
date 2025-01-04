@@ -12,6 +12,7 @@
 #include <pegium/IParser.hpp>
 #include <pegium/syntax-tree.hpp>
 #include <ranges>
+#include <source_location>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -55,175 +56,108 @@ constexpr bool success(std::size_t len) { return len != PARSE_ERROR; }
 
 constexpr bool fail(std::size_t len) { return len == PARSE_ERROR; }
 class Context;
-struct GrammarElement {
-  constexpr virtual ~GrammarElement() noexcept = default;
+struct IElement {
+  constexpr virtual ~IElement() noexcept = default;
   // parse the input text from a terminal: no hidden/ignored token between
   // elements
   virtual std::size_t parse_terminal(std::string_view sv) const noexcept = 0;
   // parse the input text from a rule: hidden/ignored token between elements are
   // skipped
   virtual std::size_t parse_rule(std::string_view sv, CstNode &parent,
-                                 Context &c) const noexcept = 0;
+                                 Context &c) const = 0;
 };
 
 template <typename T>
-concept isGrammarElement = std::derived_from<T, GrammarElement>;
+concept IsGrammarElement = std::derived_from<T, IElement>;
 
-struct Rule : GrammarElement {
-  virtual ParseResult parse(std::string_view text, Context &c) const;
+struct IRule : IElement {
+  virtual ParseResult parse(std::string_view text, Context &c) const = 0;
+  virtual std::any getValue(const CstNode &node) const = 0;
 };
+
+struct TerminalRule;
 class Context final {
 public:
-  explicit constexpr Context(std::vector<const Rule *> &&hiddens)
+  explicit Context(std::vector<const TerminalRule *> &&hiddens)
       : _hiddens{std::move(hiddens)} {
     // TODO check dynamically that all rules are Terminal Rules
   }
 
-  constexpr std::size_t skipHiddenNodes(std::string_view sv,
-                                        CstNode &node) const noexcept {
-
-    std::size_t i = 0;
-    while (true) {
-      bool matched = false;
-
-      for (const auto *rule : _hiddens) {
-        const auto len = rule->parse_terminal({sv.data() + i, sv.size() - i});
-        if (success(len)) {
-          assert(
-              len &&
-              "An hidden terminal rule must consume at least one character.");
-
-          auto &hiddenNode = node.content.emplace_back();
-          hiddenNode.text = {sv.data() + i, len};
-          hiddenNode.grammarSource = rule;
-          hiddenNode.isLeaf = true;
-          hiddenNode.hidden = true;
-
-          i += len;
-          matched = true;
-        }
-      }
-
-      if (!matched) {
-        break;
-      }
-    }
-    return i;
-  }
+  std::size_t skipHiddenNodes(std::string_view sv, CstNode &node) const;
 
 private:
-  std::vector<const Rule *> _hiddens;
+  std::vector<const TerminalRule *> _hiddens;
 };
 using ContextProvider = std::function<Context()>;
 
-inline ParseResult Rule::parse(std::string_view text, Context &c) const {
-  ParseResult result;
-  result.root_node = std::make_shared<RootCstNode>();
-  result.root_node->fullText = text;
-  std::string_view sv = result.root_node->fullText;
-  result.root_node->text = result.root_node->fullText;
-  result.root_node->grammarSource = this;
+struct RuleCall final : IElement {
 
-  auto i = c.skipHiddenNodes(sv, *result.root_node);
+  // here the rule parameter is a reference on the shared_ptr instead of on the
+  // rule because the rule may not be allocated/initialized yet
+  explicit RuleCall(const std::shared_ptr<IRule> &rule) : _rule{rule} {}
 
-  result.len =
-      i + parse_rule({sv.data() + i, sv.size() - i}, *result.root_node, c);
+  std::size_t parse_rule(std::string_view sv, CstNode &parent,
+                         Context &c) const override {
+    assert(_rule && "Call of an undefined rule.");
+    return _rule->parse_rule(sv, parent, c);
+  }
 
-  result.ret = result.len == sv.size();
+  std::size_t parse_terminal(std::string_view sv) const noexcept override {
+    assert(_rule && "Call of an undefined rule.");
+    return _rule->parse_terminal(sv);
+  }
 
-  return result;
-}
+private:
+  const std::shared_ptr<IRule> &_rule;
+};
+struct RuleWrapper final : IElement {
 
-struct ParserRule final : Rule {
+  // here the rule parameter is a reference on the shared_ptr instead of on the
+  // rule because the rule may not be allocated/initialized yet
+  explicit RuleWrapper(const IRule &rule) : _rule{rule} {}
+
+  std::size_t parse_rule(std::string_view sv, CstNode &parent,
+                         Context &c) const override {
+    return _rule.parse_rule(sv, parent, c);
+  }
+
+  std::size_t parse_terminal(std::string_view sv) const noexcept override {
+    return _rule.parse_terminal(sv);
+  }
+
+private:
+  const IRule &_rule;
+};
+template <typename T>
+concept IsRuleCall = std::same_as<T, RuleCall> || std::same_as<T, RuleWrapper>;
+
+struct ParserRule final : IRule {
   ParserRule() = default;
   ParserRule(const ParserRule &) = delete;
   ParserRule &operator=(const ParserRule &) = delete;
-  std::size_t parse_terminal(std::string_view sv) const noexcept override {
-    return _element->parse_terminal(sv);
-  }
-  std::size_t parse_rule(std::string_view sv, CstNode &parent,
-                         Context &c) const noexcept override {
-    auto i = _element->parse_rule(sv, parent, c);
-    if (fail(i)) {
-      return PARSE_ERROR;
+
+  std::any getValue(const CstNode &node) const override {
+
+    // TODO iterate over all nodes with an assignment or action or rull call
+    // Instantiate the current object when the first assignment is encountered
+    // skip DataRule & TerminalRule
+    for (auto &n : node) {
     }
-    auto &node = parent.content.emplace_back();
-    node.text = {sv.data(), i};
-    node.grammarSource = this;
-    node.isLeaf = true;
-
-    return i + c.skipHiddenNodes({sv.data() + i, sv.size() - i}, parent);
+    return 0;
   }
-
-  /// Initialize the rule with a list of elements
-  /// @tparam ...Args
-  /// @param ...args the list of elements
-  /// @return a reference to the rule
-  // template <typename... Args>
-  //  requires(std::derived_from<Args, GrammarElement> && ...)
-  ParserRule &operator()(auto... args) {
-    _element =
-        std::make_shared<std::decay_t<decltype((args, ...))>>((args, ...));
-    return *this;
-  }
-
-private:
-  std::shared_ptr<GrammarElement> _element;
-};
-struct DataTypeRule final : Rule {
-  DataTypeRule() = default;
-  DataTypeRule(const DataTypeRule &) = delete;
-  DataTypeRule &operator=(const DataTypeRule &) = delete;
-  std::size_t parse_terminal(std::string_view sv) const noexcept override {
-    return _element->parse_terminal(sv);
-  }
-  std::size_t parse_rule(std::string_view sv, CstNode &parent,
-                         Context &c) const noexcept override {
-    auto i = _element->parse_rule(sv, parent, c);
-    if (fail(i)) {
-      return PARSE_ERROR;
-    }
-    auto &node = parent.content.emplace_back();
-    node.text = {sv.data(), i};
-    node.grammarSource = this;
-    node.isLeaf = true;
-
-    return i + c.skipHiddenNodes({sv.data() + i, sv.size() - i}, parent);
-  }
-
-  /// Initialize the rule with a list of elements
-  /// @tparam ...Args
-  /// @param ...args the list of elements
-  /// @return a reference to the rule
-  // template <typename... Args>
-  // requires(std::derived_from<Args, GrammarElement> && ...)
-  DataTypeRule &operator()(auto... args) {
-    _element =
-        std::make_shared<std::decay_t<decltype((args, ...))>>((args, ...));
-    return *this;
-  }
-
-private:
-  std::shared_ptr<GrammarElement> _element;
-};
-
-struct TerminalRule final : Rule {
-  TerminalRule() = default;
-  TerminalRule(const TerminalRule &) = delete;
-  TerminalRule &operator=(const TerminalRule &) = delete;
 
   ParseResult parse(std::string_view text, Context &c) const override {
     ParseResult result;
     result.root_node = std::make_shared<RootCstNode>();
     result.root_node->fullText = text;
     std::string_view sv = result.root_node->fullText;
+    result.root_node->text = result.root_node->fullText;
     result.root_node->grammarSource = this;
 
-    result.len = parse_terminal(sv);
-    result.root_node->isLeaf = true;
+    auto i = c.skipHiddenNodes(sv, *result.root_node);
 
-    if (fail(result.len))
-      result.root_node->text = {};
+    result.len =
+        i + parse_rule({sv.data() + i, sv.size() - i}, *result.root_node, c);
 
     result.ret = result.len == sv.size();
 
@@ -233,33 +167,160 @@ struct TerminalRule final : Rule {
     return _element->parse_terminal(sv);
   }
   std::size_t parse_rule(std::string_view sv, CstNode &parent,
-                         Context &c) const noexcept override {
-    auto i = parse_terminal(sv);
+                         Context &c) const override {
+    auto size = parent.content.size();
+    auto &node = parent.content.emplace_back();
+    auto i = _element->parse_rule(sv, node, c);
+    if (fail(i)) {
+      parent.content.resize(size);
+      return PARSE_ERROR;
+    }
+    node.text = {sv.data(), i};
+    node.grammarSource = this;
+
+    return i;
+  }
+
+  /// Initialize the rule with an element
+  /// @tparam Element
+  /// @param element the element
+  /// @return a reference to the rule
+  template <typename Element>
+    requires(IsGrammarElement<Element>)
+  RuleWrapper operator=(Element element) {
+    _element = std::make_shared<std::decay_t<Element>>(element);
+    return RuleWrapper{*this};
+  }
+
+private:
+  std::shared_ptr<IElement> _element;
+};
+struct DataTypeRule final : IRule {
+  DataTypeRule(const DataTypeRule &) = delete;
+  DataTypeRule &operator=(const DataTypeRule &) = delete;
+  template <typename Func>
+    requires(!std::same_as<std::decay_t<Func>, DataTypeRule>)
+  explicit DataTypeRule(Func &&value_converter)
+      : _value_converter{std::forward<Func>(value_converter)} {}
+
+  std::any getValue(const CstNode &node) const override {
+    return _value_converter(node);
+  }
+
+  ParseResult parse(std::string_view text, Context &c) const override {
+    ParseResult result;
+    result.root_node = std::make_shared<RootCstNode>();
+    result.root_node->fullText = text;
+    std::string_view sv = result.root_node->fullText;
+    result.root_node->text = result.root_node->fullText;
+    result.root_node->grammarSource = this;
+
+    // skip leading hidden nodes
+    auto i = c.skipHiddenNodes(sv, *result.root_node);
+
+    result.len =
+        i + parse_rule({sv.data() + i, sv.size() - i}, *result.root_node, c);
+
+    result.ret = result.len == sv.size();
+    result.value = getValue(*result.root_node);
+
+    return result;
+  }
+
+  std::size_t parse_terminal(std::string_view sv) const noexcept override {
+    return _element->parse_terminal(sv);
+  }
+  std::size_t parse_rule(std::string_view sv, CstNode &parent,
+                         Context &c) const override {
+
+    auto size = parent.content.size();
+    auto &node = parent.content.emplace_back();
+    auto i = _element->parse_rule(sv, node, c);
+    if (fail(i)) {
+      parent.content.resize(size);
+      return PARSE_ERROR;
+    }
+    node.text = {sv.data(), i};
+    node.grammarSource = this;
+
+    return i;
+  }
+
+  /// Initialize the rule with an element
+  /// @tparam Element
+  /// @param element the element
+  /// @return a reference to the rule
+
+  template <typename Element>
+    requires(IsGrammarElement<Element>)
+  RuleWrapper operator=(Element element) {
+    _element = std::make_shared<std::decay_t<Element>>(element);
+    return RuleWrapper{*this};
+  }
+
+private:
+  std::shared_ptr<IElement> _element;
+  std::function<std::any(const CstNode &)> _value_converter;
+};
+
+struct TerminalRule final : IRule {
+  TerminalRule(const TerminalRule &) = delete;
+  TerminalRule &operator=(const TerminalRule &) = delete;
+  template <typename Func>
+    requires(!std::same_as<std::decay_t<Func>, TerminalRule>)
+  explicit TerminalRule(Func &&value_converter)
+      : _value_converter{std::forward<Func>(value_converter)} {}
+
+  std::any getValue(const CstNode &node) const noexcept override {
+    return _value_converter(node);
+  }
+  ParseResult parse(std::string_view text, Context &c) const override {
+    ParseResult result;
+    result.root_node = std::make_shared<RootCstNode>();
+    result.root_node->fullText = text;
+    result.root_node->text = result.root_node->fullText;
+    std::string_view sv = result.root_node->fullText;
+    result.root_node->grammarSource = this;
+
+    result.len = parse_terminal(sv);
+    result.root_node->isLeaf = true;
+
+    result.value = _value_converter(*result.root_node);
+
+    result.ret = result.len == sv.size();
+
+    return result;
+  }
+  std::size_t parse_terminal(std::string_view sv) const noexcept override {
+    return _element->parse_terminal(sv);
+  }
+  std::size_t parse_rule(std::string_view sv, CstNode &parent,
+                         Context &c) const override {
+    auto i = _element->parse_terminal(sv);
     if (fail(i)) {
       return PARSE_ERROR;
     }
     // Do not create a node if the rule is ignored
-    if (_kind != TerminalRule::Kind::Ignored) {
-      auto &node = parent.content.emplace_back();
-      node.text = {sv.data(), i};
-      node.grammarSource = this;
-      node.isLeaf = true;
-      node.hidden = _kind == TerminalRule::Kind::Hidden;
-    }
+    assert(_kind != TerminalRule::Kind::Ignored);
+    auto &node = parent.content.emplace_back();
+    node.text = {sv.data(), i};
+    node.grammarSource = this;
+    node.isLeaf = true;
+    node.hidden = _kind == TerminalRule::Kind::Hidden;
+
+    // skip hidden nodes after the token
     return i + c.skipHiddenNodes({sv.data() + i, sv.size() - i}, parent);
   }
 
-  /// Initialize the rule with a list of elements
-  /// @tparam ...Args
-  /// @param ...args the list of elements
+  /// Initialize the rule with an element
+  /// @tparam Element
+  /// @param element the element
   /// @return a reference to the rule
-  template <typename... Args>
-  // requires(std::derived_from<std::unwrap_ref_decay_t<Args>, GrammarElement>
-  // && ...)
-  TerminalRule &operator()(Args... args) {
-    _element =
-        std::make_shared<std::decay_t<decltype((args, ...))>>((args, ...));
-    return *this;
+  template <typename Element>
+    requires(IsGrammarElement<Element>)
+  RuleWrapper operator=(Element element) {
+    _element = std::make_shared<std::decay_t<Element>>(element);
+    return RuleWrapper{*this};
   }
 
   /// @return true if the rule is  hidden or ignored, false otherwise
@@ -286,9 +347,44 @@ private:
     Ignored
   };
 
-  std::shared_ptr<GrammarElement> _element;
+  std::shared_ptr<IElement> _element;
   Kind _kind = Kind::Normal;
+  std::function<std::any(const CstNode &)> _value_converter;
 };
+
+inline std::size_t Context::skipHiddenNodes(std::string_view sv,
+                                            CstNode &node) const {
+
+  std::size_t i = 0;
+  while (true) {
+
+    bool matched = false;
+
+    for (const auto *rule : _hiddens) {
+      const auto len = rule->parse_terminal({sv.data() + i, sv.size() - i});
+      if (success(len)) {
+        assert(len &&
+               "An hidden terminal rule must consume at least one character.");
+
+        if (!rule->ignored()) {
+          auto &hiddenNode = node.content.emplace_back();
+          hiddenNode.text = {sv.data() + i, len};
+          hiddenNode.grammarSource = rule;
+          hiddenNode.isLeaf = true;
+          hiddenNode.hidden = true;
+        }
+
+        i += len;
+        matched = true;
+      }
+    }
+
+    if (!matched) {
+      break;
+    }
+  }
+  return i;
+}
 
 /// Build an array of char (remove the ending '\0')
 /// @tparam N the number of char without the ending '\0'
@@ -316,11 +412,11 @@ constexpr bool isword(char c) {
 }
 
 template <std::array<bool, 256> lookup>
-struct CharactersRanges final : GrammarElement {
+struct CharactersRanges final : IElement {
   constexpr ~CharactersRanges() override = default;
 
   constexpr std::size_t parse_rule(std::string_view sv, CstNode &parent,
-                                   Context &c) const noexcept override {
+                                   Context &c) const override {
     auto i = CharactersRanges::parse_terminal(sv);
     if (fail(i) || (sv.size() > i && isword(sv[i - 1]) && isword(sv[i]))) {
       return PARSE_ERROR;
@@ -390,11 +486,11 @@ template <range_array_builder builder> consteval auto operator""_cr() {
 }
 
 template <auto literal, bool case_sensitive = true>
-struct Literal final : GrammarElement {
+struct Literal final : IElement {
   constexpr ~Literal() override = default;
 
   constexpr std::size_t parse_rule(std::string_view sv, CstNode &parent,
-                                   Context &c) const noexcept override {
+                                   Context &c) const override {
 
     auto i = Literal::parse_terminal(sv);
     if (fail(i) || (isword(literal.back()) && isword(sv[i]))) {
@@ -444,14 +540,22 @@ private:
     return case_sensitive;
   }
 };
+
+template <typename T> struct IsLiteralImpl : std::false_type {};
+template <auto literal, bool case_sensitive>
+struct IsLiteralImpl<Literal<literal, case_sensitive>> : std::true_type {};
+
+template <typename T>
+concept IsLiteral = IsLiteralImpl<T>::value;
+
 template <char_array_builder builder> consteval auto operator""_kw() {
   static_assert(!builder.value.empty(), "A keyword cannot be empty.");
   return Literal<builder.value>{};
 }
 
 template <typename... Elements>
-  requires(isGrammarElement<std::decay_t<Elements>> && ...)
-struct Group : GrammarElement {
+  requires(IsGrammarElement<std::decay_t<Elements>> && ...)
+struct Group : IElement {
   static_assert(sizeof...(Elements) > 1,
                 "A Group shall contains at least 2 elements.");
   constexpr ~Group() override = default;
@@ -476,7 +580,7 @@ struct Group : GrammarElement {
   }
 
   constexpr std::size_t parse_rule(std::string_view sv, CstNode &parent,
-                                   Context &c) const noexcept override {
+                                   Context &c) const override {
     std::size_t i = 0;
 
     std::apply(
@@ -517,29 +621,29 @@ struct Group : GrammarElement {
 };
 
 template <typename... Lhs, typename... Rhs>
-constexpr auto operator,(Group<Lhs...> lhs, Group<Rhs...> rhs) {
+constexpr auto operator+(Group<Lhs...> lhs, Group<Rhs...> rhs) {
   return Group<std::decay_t<Lhs>..., std::decay_t<Rhs>...>{
       std::tuple_cat(lhs.elements, rhs.elements)};
 }
 template <typename... Lhs, typename Rhs>
-constexpr auto operator,(Group<Lhs...> lhs, Rhs rhs) {
+constexpr auto operator+(Group<Lhs...> lhs, Rhs rhs) {
   return Group<std::decay_t<Lhs>..., std::decay_t<Rhs>>{
       std::tuple_cat(lhs.elements, std::make_tuple(rhs))};
 }
 template <typename Lhs, typename... Rhs>
-constexpr auto operator,(Lhs lhs, Group<Rhs...> rhs) {
+constexpr auto operator+(Lhs lhs, Group<Rhs...> rhs) {
   return Group<std::decay_t<Lhs>, std::decay_t<Rhs>...>{
       std::tuple_cat(std::make_tuple(lhs), rhs.elements)};
 }
 
 template <typename Lhs, typename Rhs>
-constexpr auto operator,(Lhs lhs, Rhs rhs) {
+constexpr auto operator+(Lhs lhs, Rhs rhs) {
   return Group<std::decay_t<Lhs>, std::decay_t<Rhs>>{std::make_tuple(lhs, rhs)};
 }
 
 template <typename... Elements>
-  requires(isGrammarElement<Elements> && ...)
-struct UnorderedGroup : GrammarElement {
+  requires(IsGrammarElement<Elements> && ...)
+struct UnorderedGroup : IElement {
   static_assert(sizeof...(Elements) > 1,
                 "An UnorderedGroup shall contains at least 2 elements.");
   constexpr ~UnorderedGroup() override = default;
@@ -554,7 +658,7 @@ struct UnorderedGroup : GrammarElement {
   static constexpr bool
   parse_rule_element(const T &element, std::string_view sv, CstNode &parent,
                      Context &c, std::size_t &i, ProcessedFlags &processed,
-                     std::size_t index) noexcept {
+                     std::size_t index) {
     if (processed[index]) {
       return false;
     }
@@ -570,7 +674,7 @@ struct UnorderedGroup : GrammarElement {
   }
 
   constexpr std::size_t parse_rule(std::string_view sv, CstNode &parent,
-                                   Context &c) const noexcept override {
+                                   Context &c) const override {
     std::size_t i = 0;
     ProcessedFlags processed{};
 
@@ -659,8 +763,8 @@ constexpr auto operator&(Lhs lhs, Rhs rhs) {
 }
 
 template <typename... Elements>
-  requires(isGrammarElement<Elements> && ...)
-struct OrderedChoice : GrammarElement {
+  requires(IsGrammarElement<Elements> && ...)
+struct OrderedChoice : IElement {
   static_assert(sizeof...(Elements) > 1,
                 "An OrderedChoice shall contains at least 2 elements.");
   constexpr ~OrderedChoice() override = default;
@@ -672,7 +776,7 @@ struct OrderedChoice : GrammarElement {
   template <typename T>
   static constexpr bool
   parse_rule_element(const T &element, std::string_view sv, CstNode &parent,
-                     Context &c, std::size_t size, std::size_t &i) noexcept {
+                     Context &c, std::size_t size, std::size_t &i) {
     i = element.parse_rule(sv, parent, c);
     if (success(i)) {
       return true;
@@ -682,7 +786,7 @@ struct OrderedChoice : GrammarElement {
   }
 
   constexpr std::size_t parse_rule(std::string_view sv, CstNode &parent,
-                                   Context &c) const noexcept override {
+                                   Context &c) const override {
     std::size_t i = PARSE_ERROR;
     std::apply(
         [&](const auto &...element) {
@@ -719,33 +823,33 @@ constexpr auto operator|(OrderedChoice<Lhs...> lhs, OrderedChoice<Rhs...> rhs) {
       std::tuple_cat(lhs.elements, rhs.elements)};
 }
 template <typename... Lhs, typename Rhs>
-  requires isGrammarElement<Rhs>
+  requires IsGrammarElement<Rhs>
 constexpr auto operator|(OrderedChoice<Lhs...> lhs, Rhs rhs) {
   return OrderedChoice<std::decay_t<Lhs>..., std::decay_t<Rhs>>{
       std::tuple_cat(lhs.elements, std::make_tuple(rhs))};
 }
 template <typename Lhs, typename... Rhs>
-  requires isGrammarElement<Lhs>
+  requires IsGrammarElement<Lhs>
 constexpr auto operator|(Lhs lhs, OrderedChoice<Rhs...> rhs) {
   return OrderedChoice<std::decay_t<Lhs>, std::decay_t<Rhs>...>{
       std::tuple_cat(std::make_tuple(lhs), rhs.elements)};
 }
 template <typename Lhs, typename Rhs>
-  requires isGrammarElement<Lhs> && isGrammarElement<Rhs>
+  requires IsGrammarElement<Lhs> && IsGrammarElement<Rhs>
 constexpr auto operator|(Lhs lhs, Rhs rhs) {
   return OrderedChoice<std::decay_t<Lhs>, std::decay_t<Rhs>>{
       std::make_tuple(lhs, rhs)};
 }
 
-template <std::size_t min, std::size_t max, typename T>
-  requires isGrammarElement<T>
-struct Repetition : GrammarElement {
+template <std::size_t min, std::size_t max, typename Element>
+  requires IsGrammarElement<Element>
+struct Repetition : IElement {
   constexpr ~Repetition() override = default;
-  T element;
-  constexpr explicit Repetition(T element) : element{element} {}
+  Element element;
+  constexpr explicit Repetition(Element element) : element{element} {}
 
   constexpr std::size_t parse_rule(std::string_view sv, CstNode &parent,
-                                   Context &c) const noexcept override {
+                                   Context &c) const override {
     std::size_t count = 0;
     std::size_t i = 0;
     auto size = parent.content.size();
@@ -796,102 +900,104 @@ struct Repetition : GrammarElement {
 };
 
 /// Create an option (zero or one)
-/// @tparam ...Args
-/// @param ...args a sequence of elements to be repeated
+/// @tparam Element
+/// @param element the element to be repeated
 /// @return The created Repetition
-template <typename... Args>
-  requires(isGrammarElement<Args> && ...)
-constexpr auto opt(Args... args) {
-  return Repetition<0, 1, std::decay_t<decltype((args, ...))>>{(args, ...)};
+template <typename Element>
+  requires(IsGrammarElement<Element>)
+constexpr auto opt(Element element) {
+  return Repetition<0, 1, std::decay_t<Element>>{element};
 }
 
 /// Create a repetition of zero or more elements
-/// @tparam ...Args
-/// @param ...args a sequence of elements to be repeated
+/// @tparam Element
+/// @param element the element to be repeated
 /// @return The created Repetition
-template <typename... Args>
-  requires(isGrammarElement<Args> && ...)
-constexpr auto many(Args... args) {
+template <typename Element>
+  requires(IsGrammarElement<Element>)
+constexpr auto many(Element element) {
   return Repetition<0, std::numeric_limits<std::size_t>::max(),
-                    std::decay_t<decltype((args, ...))>>{(args, ...)};
+                    std::decay_t<Element>>{element};
 }
 
 /// Create a repetition of one or more elements
-/// @tparam ...Args
-/// @param ...args a sequence of elements to be repeated
+/// @tparam Element
+/// @param element the element to be repeated
 /// @return The created Repetition
-template <typename... Args>
-  requires(isGrammarElement<Args> && ...)
-constexpr auto at_least_one(Args... args) {
+template <typename Element>
+  requires(IsGrammarElement<Element>)
+constexpr auto at_least_one(Element element) {
   return Repetition<1, std::numeric_limits<std::size_t>::max(),
-                    std::decay_t<decltype((args, ...))>>{(args, ...)};
+                    std::decay_t<Element>>{element};
 }
 
 /// Create a repetition of one or more elements with a separator
-/// @tparam ...Args
+/// `element (sep element)*`
+/// @tparam Element
 /// @param sep the separator to be used between elements
-/// @param ...args a sequence of elements to be repeated
+/// @param element the element to be repeated
 /// @return The created Repetition
-template <typename Sep, typename... Args>
-  requires isGrammarElement<Sep> && (isGrammarElement<Args> && ...)
-constexpr auto at_least_one_sep(Sep sep, Args... args) {
-  return (args, ...), many(sep, (args, ...));
+template <typename Sep, typename Element>
+  requires IsGrammarElement<Sep> && (IsGrammarElement<Element>)
+constexpr auto at_least_one_sep(Sep sep, Element element) {
+  return element + many(sep + element);
 }
 
 /// Create a repetition of zero or more elements with a separator
-/// @tparam ...Args
+/// `(element (sep element)*)?`
+/// @tparam Element
 /// @param sep the separator to be used between elements
-/// @param ...args a sequence of elements to be repeated
+/// @param element the element to be repeated
 /// @return The created Repetition
-template <typename Sep, typename... Args>
-  requires isGrammarElement<Sep> && (isGrammarElement<Args> && ...)
-constexpr auto many_sep(Sep sep, Args... args) {
-  return opt(at_least_one_sep(sep, args...));
+template <typename Sep, typename Element>
+  requires IsGrammarElement<Sep> && (IsGrammarElement<Element>)
+constexpr auto many_sep(Sep sep, Element element) {
+  return opt(at_least_one_sep(sep, element));
 }
 
 /// Create a custom repetition with min and max.
-/// @tparam ...Args
-/// @param ...args a sequence of elements to be repeated
+/// @tparam Element
+/// @param element the elements to be repeated
 /// @param min the min number of occurence (inclusive)
 /// @param max the maw number of occurence (inclusive)
 /// @return The created Repetition
-template <std::size_t min, std::size_t max, typename... Args>
-  requires(isGrammarElement<Args> && ...)
-constexpr auto rep(Args... args) {
-  return Repetition<min, max, std::decay_t<decltype((args, ...))>>{(args, ...)};
+template <std::size_t min, std::size_t max, typename Element>
+  requires(IsGrammarElement<Element>)
+constexpr auto rep(Element element) {
+  return Repetition<min, max, std::decay_t<Element>>{element};
 }
 
 /// Create a repetition of one or more elements
-/// @tparam ...T
-/// @param ...arg the element to be repeated
+/// @tparam Element
+/// @param arg the element to be repeated
 /// @return The created Repetition
-template <typename T>
-  requires isGrammarElement<T>
-constexpr auto operator+(T arg) {
+template <typename Element>
+  requires IsGrammarElement<Element>
+constexpr auto operator+(Element arg) {
   return Repetition<1, std::numeric_limits<std::size_t>::max(),
-                    std::decay_t<T>>{arg};
+                    std::decay_t<Element>>{arg};
 }
 
 /// Create a repetition of zero or more elements
-/// @tparam ...T
-/// @param ...arg the element to be repeated
+/// @tparam Element
+/// @param arg the element to be repeated
 /// @return The created Repetition
-template <typename T>
-  requires isGrammarElement<T>
-constexpr auto operator*(T arg) {
+template <typename Element>
+  requires IsGrammarElement<Element>
+constexpr auto operator*(Element arg) {
   return Repetition<0, std::numeric_limits<std::size_t>::max(),
-                    std::decay_t<T>>{arg};
+                    std::decay_t<Element>>{arg};
 }
 
-template <typename T>
-  requires isGrammarElement<T>
-struct AndPredicate : GrammarElement {
+template <typename Element>
+  requires IsGrammarElement<Element>
+struct AndPredicate : IElement {
   constexpr ~AndPredicate() override = default;
-  T element;
-  explicit constexpr AndPredicate(T element) : element{element} {}
+  Element element;
+  explicit constexpr AndPredicate(Element element) : element{element} {}
 
   constexpr std::size_t parse_rule(std::string_view sv, CstNode &,
-                                   Context &c) const noexcept override {
+                                   Context &c) const override {
     CstNode node;
     return success(element.parse_rule(sv, node, c)) ? 0 : PARSE_ERROR;
   }
@@ -901,20 +1007,20 @@ struct AndPredicate : GrammarElement {
   }
 };
 
-template <typename T>
-  requires isGrammarElement<T>
-constexpr auto operator&(T element) {
-  return AndPredicate<std::decay_t<T>>{element};
+template <typename Element>
+  requires IsGrammarElement<Element>
+constexpr auto operator&(Element element) {
+  return AndPredicate<std::decay_t<Element>>{element};
 }
 
-template <typename T>
-  requires isGrammarElement<T>
-struct NotPredicate : GrammarElement {
+template <typename Element>
+  requires IsGrammarElement<Element>
+struct NotPredicate : IElement {
   constexpr ~NotPredicate() override = default;
-  T element;
-  explicit constexpr NotPredicate(T element) : element{element} {}
+  Element element;
+  explicit constexpr NotPredicate(Element element) : element{element} {}
   constexpr std::size_t parse_rule(std::string_view sv, CstNode &,
-                                   Context &c) const noexcept override {
+                                   Context &c) const override {
     CstNode node;
     return success(element.parse_rule(sv, node, c)) ? PARSE_ERROR : 0;
   }
@@ -925,17 +1031,17 @@ struct NotPredicate : GrammarElement {
   }
 };
 
-template <typename T>
-  requires isGrammarElement<T>
-constexpr auto operator!(T element) {
-  return NotPredicate<std::decay_t<T>>{element};
+template <typename Element>
+  requires IsGrammarElement<Element>
+constexpr auto operator!(Element element) {
+  return NotPredicate<std::decay_t<Element>>{element};
 }
 
-struct AnyCharacter final : GrammarElement {
-  constexpr ~AnyCharacter() override = default;
+struct AnyCharacter final : IElement {
+  constexpr ~AnyCharacter() noexcept override = default;
 
   constexpr std::size_t parse_rule(std::string_view sv, CstNode &parent,
-                                   Context &c) const noexcept override {
+                                   Context &c) const override {
     auto i = codepoint_length(sv);
     if (fail(i)) {
       return PARSE_ERROR;
@@ -973,39 +1079,74 @@ private:
   }
 };
 
-struct RuleCall final : GrammarElement {
+template <typename T> struct IsAssignableOrderedChoiceImpl : std::false_type {};
 
-  // here the rule parameter is a reference on the shared_ptr instead of on the
-  // rule because the rule may not be allocated/initialized yet
-  explicit RuleCall(const std::shared_ptr<Rule> &rule) : _rule(rule) {}
-
-  std::size_t parse_rule(std::string_view sv, CstNode &parent,
-                         Context &c) const noexcept override {
-    assert(_rule && "Call of an undefined rule.");
-    return _rule->parse_rule(sv, parent, c);
-  }
-
-  std::size_t parse_terminal(std::string_view sv) const noexcept override {
-    assert(_rule && "Call of an undefined rule.");
-    return _rule->parse_terminal(sv);
-  }
-
-private:
-  const std::shared_ptr<Rule> &_rule;
+template <typename... Ts>
+struct IsAssignableOrderedChoiceImpl<OrderedChoice<Ts...>>
+    : std::conjunction<std::bool_constant<IsRuleCall<Ts> || IsLiteral<Ts>>...> {
 };
 
+template <typename T>
+concept IsAssignableOrderedChoice = IsAssignableOrderedChoiceImpl<T>::value;
+
+template <typename T>
+concept IsAssignable =
+    IsRuleCall<T> || IsLiteral<T> || IsAssignableOrderedChoice<T>;
+
+struct IAssignment : IElement {
+  virtual void execute(AstNode *current, const CstNode &node) const = 0;
+};
+
+// Generic
+template <typename T> struct AnyConverterAssigner {
+  void operator()(T &member, std::any value) const {
+    member = std::any_cast<T>(value);
+  }
+};
+template <typename T> struct AnyConverterAssigner<Reference<T>> {
+  void operator()(Reference<T> &member, std::any value) const {
+    member = std::any_cast<std::string>(value);
+  }
+};
+template <typename T> struct AnyConverterAssigner<std::shared_ptr<T>> {
+  void operator()(std::shared_ptr<T> &member, std::any value) const {
+    member = std::dynamic_pointer_cast<T>(
+        std::any_cast<std::shared_ptr<AstNode>>(value));
+  }
+};
+
+template <typename T> struct AnyConverterAssigner<std::vector<T>> {
+  void operator()(std::vector<T> &member, std::any value) const {
+    member.emplace_back(std::any_cast<T>(value));
+  }
+};
+template <typename T>
+struct AnyConverterAssigner<std::vector<std::shared_ptr<T>>> {
+  void operator()(std::vector<std::shared_ptr<T>> &member,
+                  std::any value) const {
+    member.emplace_back(std::dynamic_pointer_cast<T>(
+        std::any_cast<std::shared_ptr<AstNode>>(value)));
+  }
+};
+template<auto...  Vs> [[nodiscard]] constexpr auto function_name() noexcept -> std::string_view { return std::source_location::current().function_name(); }
+template<class... Ts> [[nodiscard]] constexpr auto function_name() noexcept -> std::string_view { return std::source_location::current().function_name(); }
+
 template <auto feature, typename Element>
-struct Assignment final : GrammarElement {
+  requires std::is_member_object_pointer_v<decltype(feature)>
+struct Assignment final : IAssignment {
+  static_assert(IsAssignable<Element>,
+                "An assignment can only contains a RuleCall or a Literal or an "
+                "OrderedChoice of RuleCall or Literal.");
+
   Element element;
   constexpr explicit Assignment(Element element) : element{element} {}
   constexpr std::size_t parse_rule(std::string_view sv, CstNode &parent,
-                                   Context &c) const noexcept override {
-    CstNode node;
-    auto i = element.parse_rule(sv, node, c);
+                                   Context &c) const override {
+
+    auto index = parent.content.size();
+    auto i = element.parse_rule(sv, parent, c);
     if (success(i)) {
-      node.text = {sv.data(), i};
-      node.grammarSource = this;
-      parent.content.emplace_back(std::move(node));
+      parent.content[index].action = this;
     }
     return i;
   }
@@ -1014,28 +1155,82 @@ struct Assignment final : GrammarElement {
     assert(false && "An Assignment cannot be in a terminal.");
     return PARSE_ERROR;
   }
+  void execute(AstNode *current, const CstNode &node) const override {
+
+    assert(node.content.size() == 1);
+    const auto *source = node.content.front().grammarSource;
+
+    std::any value;
+    // By design the source is either a Rule or a Literal
+    // TODO replace dynamic_cast with visitor pattern
+    if (const auto *rule = dynamic_cast<const IRule *>(source)) {
+      value = rule->getValue(node.content.front());
+    } else {
+      value = std::string{node.content.front().text};
+    }
+    do_execute(current, feature, value);
+  }
+
+  template <typename C, typename R>
+  static void do_execute(AstNode *current, R C::*member, std::any value) {
+    auto *node = dynamic_cast<C *>(current);
+    assert(node && "Tryed to assign a feature on an AstNode with wrong type.");
+    ::pegium::grammar::AnyConverterAssigner<R>{}(node->*member, value);
+  }
+
+private:
+
+  /// Helper to get the name of a member from a member object pointer
+  /// @tparam e the member object pointer
+  /// @return the name of the member
+  template <auto e> static constexpr std::string_view member_name() noexcept {
+    std::string_view func_name = function_name<e>();
+    func_name = func_name.substr(0, func_name.rfind(REF_STRUCT::end_marker));
+    return func_name.substr(func_name.rfind("::") + 2);
+  }
+  struct REF_STRUCT {
+    int MEMBER;
+
+    static constexpr auto name = function_name<&REF_STRUCT::MEMBER>();
+    static constexpr auto end_marker =
+        name.substr(name.find("REF_STRUCT::MEMBER") +
+                    std::string_view{"REF_STRUCT::MEMBER"}.size());
+  };
 };
 
+template <auto e, typename Element>
+  requires std::is_member_object_pointer_v<decltype(e)>
+static constexpr auto operator+=(auto, Element &&element) {
+  return Assignment<e, std::decay_t<Element>>(std::forward<Element>(element));
+}
+
+/*template<auto e, typename Element>
+requires std::is_member_object_pointer_v<decltype(e)>
+static constexpr auto operator +=(auto, Element element){
+  return Assignment<e, std::decay_t<Element>>(element);
+
+}*/
+
 /// Assign an element to a member of the current object
-/// @tparam ...Args
+/// @tparam Element
 /// @tparam e the member pointer
-/// @param ...args the list of grammar elements
+/// @param args the list of grammar elements
 /// @return
-template <auto e, typename... Args>
-  requires(std::derived_from<Args, GrammarElement> && ...)
-static constexpr auto assign(Args... args) {
-  return Assignment<e, std::decay_t<decltype((args, ...))>>((args, ...));
+template <auto e, typename Element>
+  requires IsGrammarElement<Element>
+static constexpr auto assign(Element element) {
+  return Assignment<e, std::decay_t<Element>>(element);
 }
 
 /// Append an element to a member of the current object
-/// @tparam ...Args
+/// @tparam Element
 /// @tparam e the member pointer
-/// @param ...args the list of grammar elements
+/// @param element the  element
 /// @return
-template <auto e, typename... Args>
-  requires(std::derived_from<Args, GrammarElement> && ...)
-static constexpr auto append(Args... args) {
-  return Assignment<e, std::decay_t<decltype((args, ...))>>((args, ...));
+template <auto e, typename Element>
+  requires IsGrammarElement<Element>
+static constexpr auto append(Element element) {
+  return Assignment<e, std::decay_t<Element>>(element);
 }
 
 /// any character equivalent to regex `.`
@@ -1063,8 +1258,8 @@ static constexpr auto D = !d;
 /// @param to the ending element
 /// @return the until element
 template <typename T, typename U>
-  requires isGrammarElement<T> && isGrammarElement<U>
+  requires IsGrammarElement<T> && IsGrammarElement<U>
 constexpr auto operator>>(T from, U to) {
-  return (from, *(!to, dot), to);
+  return from + *(!to + dot) + to;
 }
 } // namespace pegium::grammar

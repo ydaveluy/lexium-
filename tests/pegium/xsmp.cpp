@@ -1,5 +1,4 @@
 #include <chrono>
-#include <fstream>
 #include <gtest/gtest.h>
 #include <iostream>
 #include <pegium/Parser.hpp>
@@ -11,23 +10,23 @@ struct Attribute : public pegium::AstNode {
 };
 struct NamedElement : public pegium::AstNode {
   string name;
-  vector<containment<Attribute>> attributes;
+  vector<pointer<Attribute>> attributes;
 };
 struct VisibilityElement : public NamedElement {
   vector<string> modifiers;
 };
 struct Namespace;
 struct Catalogue : public NamedElement {
-  vector<containment<Namespace>> namespaces;
+  vector<pointer<Namespace>> namespaces;
 };
 
 struct Namespace : public NamedElement {
-  vector<containment<NamedElement>> members;
+  vector<pointer<NamedElement>> members;
 };
 
 struct Type : public VisibilityElement {};
 struct Structure : public Type {
-  vector<containment<NamedElement>> members;
+  vector<pointer<NamedElement>> members;
 };
 
 struct Class : public Structure {};
@@ -37,45 +36,42 @@ public:
   XsmpParser() {
 
     using namespace pegium::grammar;
-    terminal("WS").ignore()(+s);
-    terminal("SL_COMMENT").hide()("//"_kw >> &(eol | eof));
-    terminal("ML_COMMENT").hide()("/*"_kw >> "*/"_kw);
-    terminal("ID")("a-zA-Z_"_cr, *w);
-    // rule("test")(ID,ID);
-    rule("QualifiedName")(at_least_one_sep("."_kw, call("ID")));
+    terminal("WS").ignore() = +s;
+    terminal("SL_COMMENT").hide() = "//"_kw >> &(eol | eof);
+    terminal("ML_COMMENT").hide() = "/*"_kw >> "*/"_kw;
+    auto ID = terminal("ID") = "a-zA-Z_"_cr + *w;
 
-    rule<Attribute>("Attribute")(
-        "@"_kw, assign<&Attribute::type>(call("QualifiedName")),
-        opt("("_kw, ")"_kw));
-    rule<std::string>("Visibility")("private"_kw | "protected"_kw |
-                                    "public"_kw);
+    auto qfn = rule("QualifiedName") = at_least_one_sep("."_kw, ID);
 
-    auto Attributes = *append<&NamedElement::attributes>(call("Attribute"));
-    auto Name = assign<&NamedElement::name>(call("ID"));
-    auto Visibilities =
-        *append<&VisibilityElement::modifiers>(call("Visibility"));
+    auto visibility = rule("Visibility") =
+        "private"_kw | "protected"_kw | "public"_kw;
 
-    rule<Structure>("Structure")(
-        Attributes, Visibilities, "struct"_kw, Name, "{"_kw,
+    auto attribute = rule<Attribute>("Attribute") =
+        "@"_kw + assign<&Attribute::type>(qfn) + opt("("_kw + ")"_kw);
+
+    auto Attributes = *append<&NamedElement::attributes>(attribute);
+    auto Name = assign<&NamedElement::name>(ID);
+    auto Visibilities = *append<&VisibilityElement::modifiers>(visibility);
+
+    auto structure = rule<Structure>("Structure") =
+        Attributes + Visibilities + "struct"_kw + Name + "{"_kw +
         // many(&Structure::members +=       call("Constant") | call("Field")),
-        "}"_kw);
+        "}"_kw;
 
-    rule<Class>("Class")(
-        Attributes,
-        *append<&VisibilityElement::modifiers>(call("Visibility") |
-                                               "abstract"_kw),
-        "class"_kw, Name, "{"_kw,
+    auto class_ = rule<Class>("Class") =
+        Attributes +
+        *append<&VisibilityElement::modifiers>(visibility | "abstract"_kw) +
+        "class"_kw + Name + "{"_kw +
         // many(&Structure::members += call("Constant") |       call("Field")),
-        "}"_kw);
+        "}"_kw;
 
-    rule<Type>("Type")(call("Structure") | call("Class"));
-    rule<Namespace>("Namespace")(
-        Attributes, "namespace"_kw, Name, "{"_kw,
-        *append<&Namespace::members>(call("Namespace") | call("Type")), "}"_kw);
+    auto type = rule<Type>("Type") = structure | class_;
+    auto ns = rule<Namespace>("Namespace") =
+        Attributes + "namespace"_kw + Name + "{"_kw +
+        *append<&Namespace::members>(call("Namespace") | type) + "}"_kw;
 
-    rule<Catalogue>("Catalogue")(
-        Attributes, "catalogue"_kw, Name,
-        *append<&Catalogue::namespaces>(call("Namespace")));
+    rule<Catalogue>("Catalogue") = Attributes + "catalogue"_kw + Name +
+                                   *(append<&Catalogue::namespaces>(ns));
   }
 };
 
@@ -113,7 +109,7 @@ TEST(XsmpTest, TestCatalogue) {
     namespace B
     {
     }
-    /* a comment multi line*/
+    /* a comment multi line */
     )";
   }
 
@@ -125,7 +121,9 @@ TEST(XsmpTest, TestCatalogue) {
   auto duration = duration_cast<milliseconds>(end - start).count();
 
   std::cout << "Parsed " << result.len << " / " << input.size()
-            << " characters in " << duration << "ms\n"  <<  ((1000*double(result.len)/ duration)/1'000'000)<<"MB/s\n";
+            << " characters in " << duration << "ms: "
+            << ((1000 * double(result.len) / double(duration)) / 1'000'000)
+            << " Mo/s\n";
 
   EXPECT_TRUE(result.ret);
 }

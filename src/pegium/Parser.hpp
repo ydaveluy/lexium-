@@ -26,11 +26,10 @@ public:
 
     // result.value = getValue(*result.root_node);
     return result;
-    return {};
   }
   ~Parser() noexcept override = default;
 
-public:
+protected:
   template <typename T>
     requires std::derived_from<T, AstNode>
   grammar::ParserRule &rule(std::string name) {
@@ -41,41 +40,69 @@ public:
     return *rule.get();
   }
 
-  template <typename T = std::string>
-    requires(!std::derived_from<T, AstNode>)
-  grammar::DataTypeRule &rule(std::string name) {
-    auto rule = std::make_shared<grammar::DataTypeRule>(
+  template <typename T = std::string, typename Func>
+    requires(!std::derived_from<T, AstNode>) &&
+            std::same_as<std::invoke_result_t<Func, const CstNode &>, T>
+  grammar::DataTypeRule &rule(std::string name, Func &&func) {
+    auto rule = std::make_shared<grammar::DataTypeRule>(std::forward<Func>(func)
         /*name, [this] { return this->createContext(); }, make_converter<T>()*/);
 
     _rules[name] = rule;
     return *rule.get();
+  }
+  template <typename T = std::string>
+    requires(!std::derived_from<T, AstNode>)
+  grammar::DataTypeRule &rule(std::string name) {
+    // TODO provide value_converter for "standard" types
+    return rule<T>(name, [](const CstNode &node) {
+      std::string result;
+      for (auto &n : node)
+        if (n.isLeaf && !n.hidden)
+          result += n.text;
+      return result;
+    });
+  }
+
+  template <typename T = std::string, typename Func>
+    requires(!std::derived_from<T, AstNode>) &&
+            std::same_as<std::invoke_result_t<Func, const CstNode &>, T>
+  grammar::TerminalRule &terminal(std::string name, Func &&func) {
+
+    auto rule = std::make_shared<grammar::TerminalRule>(std::forward<Func>(func)
+        /*name, [this] { return this->createContext(); }, make_converter<T>()*/);
+
+    _rules[name] = rule;
+    return *rule.get();
+  }
+    template <typename T = std::string>
+    requires(!std::derived_from<T, AstNode>)
+  grammar::TerminalRule &terminal(std::string name, const T& value) {
+    return terminal<T>(
+        name, [value](const CstNode &node) { return value; });
   }
 
   template <typename T = std::string>
     requires(!std::derived_from<T, AstNode>)
   grammar::TerminalRule &terminal(std::string name) {
-
-    auto rule = std::make_shared<grammar::TerminalRule>(
-        /*name, [this] { return this->createContext(); }, make_converter<T>()*/);
-
-    _rules[name] = rule;
-    return *rule.get();
+    // TODO provide value_converter for "standard" types
+    return terminal<T>(
+        name, [](const CstNode &node) { return std::string{node.text}; });
   }
 
   /// Call an other rule
   /// @param name the rule name
   /// @return the call element
- grammar::RuleCall call(const std::string &name) {
+  grammar::RuleCall call(const std::string &name) {
     return grammar::RuleCall{_rules[name]};
   }
 
- 
 private:
   grammar::Context createContext() const {
 
-    std::vector<const grammar::Rule *> hiddens;
+    std::vector<const grammar::TerminalRule *> hiddens;
     for (auto &[_, def] : _rules) {
-      if (auto *terminal = dynamic_cast<grammar::TerminalRule *>(def.get())) {
+      if (const auto *terminal =
+              dynamic_cast<grammar::TerminalRule *>(def.get())) {
         if (terminal->hidden())
           hiddens.push_back(terminal);
       }
@@ -84,25 +111,7 @@ private:
     return grammar::Context{std::move(hiddens)};
   }
 
-  template <typename T>
-  std::function<bool(std::any &, CstNode &)> make_converter() const {
-    return [](std::any &value, CstNode &node) {
-      if constexpr (std::is_base_of_v<AstNode, T>) {
-        value = std::static_pointer_cast<AstNode>(std::make_shared<T>());
-        return true;
-      } else {
-        std::string result;
-        for (const auto &n : node) {
-          if (n.isLeaf && !n.hidden) {
-            result += n.text;
-          }
-        }
-        value = result;
-        return false;
-      }
-    };
-  }
-  std::map<std::string, std::shared_ptr<grammar::Rule>, std::less<>> _rules;
+  std::map<std::string, std::shared_ptr<grammar::IRule>, std::less<>> _rules;
 };
 
 } // namespace pegium

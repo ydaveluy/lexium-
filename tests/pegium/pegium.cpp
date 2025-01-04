@@ -26,7 +26,7 @@ constexpr auto c = "c"_kw;
 static_assert(a.parse_terminal("a") == 1);
 static_assert(a.i().parse_terminal("A") == 1);
 
-static_assert((a, b).parse_terminal("abaa") == 2);
+static_assert((a + b).parse_terminal("abaa") == 2);
 
 static_assert((a | b).parse_terminal("ab") == 1);
 static_assert((a | b).parse_terminal("ba") == 1);
@@ -36,9 +36,9 @@ static_assert(((a | b) | (c | d)).parse_terminal("c") == 1);
 static_assert((a | (c | b)).parse_terminal("c") == 1);
 static_assert(((a | b) | c).parse_terminal("c") == 1);
 
-static_assert(((a, a), a).parse_terminal("aaaa") == 3);
-static_assert(((a, a), (a, a)).parse_terminal("aaaa") == 4);
-static_assert((a, (a, a)).parse_terminal("aaaa") == 3);
+static_assert(((a + a) + a).parse_terminal("aaaa") == 3);
+static_assert(((a + a) + (a + a)).parse_terminal("aaaa") == 4);
+static_assert((a + (a + a)).parse_terminal("aaaa") == 3);
 
 static_assert(opt(a).parse_terminal("a") == 1);
 static_assert(opt(a).parse_terminal("") == 0);
@@ -54,7 +54,7 @@ static_assert((*a).parse_terminal("aaa") == 3);
 static_assert((*a).parse_terminal("") == 0);
 static_assert((*a).parse_terminal("b") == 0);
 
-static_assert("a-z"_cr.parse_terminal("b") == 1);
+static_assert("a-z"_cr.i().parse_terminal("B") == 1);
 static_assert(("a-z"_cr | "A-Z"_cr).i().parse_terminal("+") == PARSE_ERROR);
 
 TEST(Pegium2Test, DISABLED_Bench2) {

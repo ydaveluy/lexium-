@@ -78,12 +78,12 @@ struct AstNode {
   // incomplete at this stage.
   using reference = Reference<T>;
 
-  /// A containment of an object of type T (T must be derived from AstNode).
+  /// A pointer on an object of type T (T must be derived from AstNode).
   /// @tparam T type of the contained object
   template <typename T>
   // do not add requirement std::is_base_of_v<AstNode, T> because T may be
   // incomplete at this stage.
-  using containment = std::shared_ptr<T>;
+  using pointer = std::shared_ptr<T>;
 
   /// A vector of elements of type T.
   /// @tparam T type of element
@@ -103,7 +103,7 @@ struct AstNode {
 
 struct RootCstNode;
 namespace grammar {
-class GrammarElement;
+class IElement;
 }
 
 /**
@@ -115,24 +115,35 @@ struct CstNode {
   // const CstNode *container;
 
   /** The root CST node */
-  RootCstNode *root;
+  // RootCstNode *root;
 
   /** The AST node created from this CST node */
   // std::any astNode;
 
-  class Iterator {
+  template <typename NodeType> class IteratorTemplate {
   public:
     using iterator_category = std::forward_iterator_tag;
-    using value_type = CstNode;
-    using pointer = CstNode *;
-    using reference = CstNode &;
+    using value_type = NodeType;
+    using pointer = NodeType *;
+    using reference = NodeType &;
 
-    explicit Iterator(pointer root = nullptr);
-    reference operator*() const;
-    pointer operator->() const;
-    Iterator &operator++();
-    bool operator==(const Iterator &other) const;
-    void prune();
+    explicit IteratorTemplate(pointer root = nullptr) {
+      if (root) {
+        stack.emplace_back(root, 0);
+      }
+    }
+    reference operator*() const { return *stack.back().first; }
+    pointer operator->() const { return stack.back().first; }
+
+    IteratorTemplate &operator++() {
+      advance();
+      return *this;
+    }
+    bool operator==(const IteratorTemplate &other) const {
+      return stack /*.empty()*/ == other.stack /*.empty()*/;
+    }
+
+    void prune() { pruneCurrent = true; }
 
   private:
     struct NodeFrame {
@@ -142,32 +153,58 @@ struct CstNode {
       NodeFrame(pointer n, size_t index, bool p)
           : node(n), childIndex(index), prune(p) {}
       bool operator==(const NodeFrame &other) const {
-        return node == other.node /*&& childIndex == other.childIndex &&
-               prune == other.prune*/
-            ;
+        return node == other.node;
       }
     };
 
-    std::vector<std::pair<CstNode *, size_t>> stack;
+    std::vector<std::pair<pointer, size_t>> stack;
     bool pruneCurrent = false;
 
-    void advance();
+    void advance() {
+      while (!stack.empty()) {
+        auto [node, index] = stack.back();
+        stack.pop_back();
+
+        // Skip the current node's subtree if prune was called
+        if (pruneCurrent) {
+          pruneCurrent = false; // Reset prune flag
+          continue;
+        }
+
+        // Traverse child nodes
+        if (index < node->content.size()) {
+          stack.emplace_back(
+              node, index + 1); // Save next child index for the current node
+          stack.emplace_back(&node->content[index],
+                             0); // Start with the first child
+          return;
+        }
+      }
+    }
   };
+
+  using Iterator = IteratorTemplate<CstNode>;
+  using ConstIterator = IteratorTemplate<const CstNode>;
 
   Iterator begin() { return Iterator(this); }
   Iterator end() { return Iterator(); }
+  ConstIterator begin() const { return ConstIterator(this); }
+  ConstIterator end() const { return ConstIterator(); }
 
   std::vector<CstNode> content;
-  /** The actual text */
+  /// The actual text */
   std::string_view text;
-  /** The grammar element from which this node was parsed */
-  const grammar::GrammarElement *grammarSource;
-  // A leaf CST node corresponds to a token in the input token stream.
+  /// The grammar element from which this node was parsed
+  const grammar::IElement *grammarSource;
+  /// An action assignated to this node (e.g: assign value to a feature)
+  const grammar::IElement *action = nullptr;
+  /// A leaf CST node corresponds to a token in the input token stream.
   bool isLeaf = false;
-  // Whether the token is hidden, i.e. not explicitly part of the containing
-  // grammar rule (e.g: comments)
+  /// Whether the token is hidden, i.e. not explicitly part of the containing
+  /// grammar rule (e.g: comments)
   bool hidden = false;
 };
+
 
 struct RootCstNode : public CstNode {
   std::string fullText;
